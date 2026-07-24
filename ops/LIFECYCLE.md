@@ -24,24 +24,30 @@ script, a `.crabbox.yaml`, and a thin wrapper gets the same lifecycle.
 2. **Normal work stays local.** Focused/single-file tests and routine
    cached gates never touch the lane. Full local gates serialize
    host-wide (dev-tools lock).
-3. **First broad run leases a box.** `scripts/remote-box.sh` (ge) asks
-   the coordinator for a lease (GitHub identity; no provider tokens on
-   laptops; spend/lease caps enforced server-side), then
+3. **First broad run leases a box — just-in-time.** `scripts/remote-box.sh`
+   (ge) asks the coordinator for a lease (GitHub identity; no provider
+   tokens on laptops; spend/lease caps enforced server-side), then
    `ops/converge.sh` makes it test-ready: idempotent bootstrap →
    sibling repos → git-bundle seed → `deps.get` (MUST re-run after
    siblings: conditional path deps) → optional gate. Cold ≈ 10 min,
-   once per box.
+   once per box. Lease only when a remote run is imminent (minutes
+   away), never in anticipation: an idle box is reaped ~30 min after
+   its last run, and a box converged early is a converge wasted
+   (observed 2026-07-24 — two boxes reaped before their first gate).
 4. **The box serves the whole session.** The wrapper records it
    (`.crabbox/box`), health-checks before reuse, and every
    `gate`/`contracts`/`run` syncs the dirty diff (~1.5s) and executes.
    Runs heartbeat the lease; an active box never idles out. Reconverge
    after commits is cheap: unchanged siblings and git state skip
    observably.
-5. **Completion checks route by state** (project AGENTS.md policy the
-   generated workflow checkpoints defer to): live box → full/strict
-   check runs remotely; no box → local, and never lease for one gate;
-   infrastructure-shaped remote failure → fall back local; genuine
-   test failures bind either way; scoped/cached gates always local.
+5. **Final checks route to the lane by default** (project AGENTS.md
+   policy, mirrored in the dev-tools completion skills): the
+   full/strict completion gate and the guarded whole-program Reach
+   changed attempt (memory-intensive) run on a box — reuse the live
+   session box, otherwise lease just-in-time at the start of the
+   completion phase; infrastructure-shaped remote failure → fall back
+   local; genuine test failures bind either way; focused/scoped/cached
+   gates always local.
 6. **Session end.** Clean exit → launcher trap stops the lease and
    clears state (single owner per worktree assumed). Any other death →
    the coordinator reaps the idle box ~30 min after its last run
