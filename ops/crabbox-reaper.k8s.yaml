@@ -1,0 +1,127 @@
+# Crabbox reaper — idle-aware backstop for leaked crabbox test boxes.
+#
+# Runs on the always-on k3s cluster and deletes Hetzner Cloud servers
+# named `crabbox-*` that are BOTH past a grace age AND CPU-idle, plus a
+# hard age cap regardless of activity. Laptop-side layers (crabbox
+# cleanup at dev-tools entry points + scheduled sweeps) are the primary
+# lifecycle; this exists so no box survives a laptop being closed.
+#
+# Policy (tune via the CronJob env):
+#   - age < GRACE_MINUTES (60): never touched (fresh converge is quiet)
+#   - CPU max over the last IDLE_WINDOW_MINUTES (45) >= IDLE_CPU_PCT (5.0):
+#     considered active, skipped — this is the idle-awareness guarantee
+#   - idle AND age >= GRACE_MINUTES: deleted
+#   - age >= HARD_CAP_HOURS (12): deleted regardless of activity
+#
+# Install (one-time):
+#   kubectl create namespace ops --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n ops create secret generic hcloud-crabbox-reaper \
+#     --from-literal=token=<HCLOUD_TOKEN with delete scope>
+#   kubectl apply -f scripts/crabbox-reaper.k8s.yaml
+# Verify:
+#   kubectl -n ops get cronjob crabbox-reaper
+#   kubectl -n ops logs job/<latest crabbox-reaper job>
+#
+# IMPORTANT: the token can delete ANY server in the project. The script
+# hard-filters on the `crabbox-` name prefix; keep that invariant when
+# editing.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crabbox-reaper-script
+  namespace: ops
+data:
+  reap.py: |
+    import json, os, sys, urllib.request
+    from datetime import datetime, timedelta, timezone
+
+    TOKEN = os.environ["HCLOUD_TOKEN"].strip()
+    GRACE_MIN = int(os.environ.get("GRACE_MINUTES", "60"))
+    IDLE_WIN_MIN = int(os.environ.get("IDLE_WINDOW_MINUTES", "45"))
+    IDLE_CPU_PCT = float(os.environ.get("IDLE_CPU_PCT", "5.0"))
+    HARD_CAP_H = int(os.environ.get("HARD_CAP_HOURS", "12"))
+    API = "https://api.hetzner.cloud/v1"
+
+    def req(method, path, params=""):
+        r = urllib.request.Request(
+            f"{API}{path}{params}", method=method,
+            headers={"Authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            body = resp.read()
+            return json.loads(body) if body else {}
+
+    now = datetime.now(timezone.utc)
+    servers = req("GET", "/servers", "?per_page=50")["servers"]
+    boxes = [s for s in servers if s["name"].startswith("crabbox-")]
+    print(f"{len(servers)} servers, {len(boxes)} crabbox boxes")
+
+    for s in boxes:
+        name, sid = s["name"], s["id"]
+        age = now - datetime.fromisoformat(s["created"])
+        if age < timedelta(minutes=GRACE_MIN):
+            print(f"skip {name}: age {age} < grace {GRACE_MIN}m")
+            continue
+        if age >= timedelta(hours=HARD_CAP_H):
+            print(f"DELETE {name}: age {age} >= hard cap {HARD_CAP_H}h")
+            req("DELETE", f"/servers/{sid}")
+            continue
+        start = (now - timedelta(minutes=IDLE_WIN_MIN)).isoformat()
+        end = now.isoformat()
+        try:
+            m = req("GET", f"/servers/{sid}/metrics",
+                    f"?type=cpu&start={start}&end={end}")
+            vals = [float(v[1]) for v in
+                    m["metrics"]["time_series"]["cpu"]["values"]]
+        except Exception as e:
+            # Fail SAFE on metrics errors: treat as active, never delete
+            # on missing evidence (except the hard cap above).
+            print(f"skip {name}: metrics unavailable ({e}), assuming active")
+            continue
+        peak = max(vals) if vals else 0.0
+        if peak >= IDLE_CPU_PCT:
+            print(f"skip {name}: active (peak cpu {peak:.1f}% >= {IDLE_CPU_PCT}%)")
+            continue
+        print(f"DELETE {name}: idle (peak cpu {peak:.1f}%), age {age}")
+        req("DELETE", f"/servers/{sid}")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: crabbox-reaper
+  namespace: ops
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: reap
+              image: python:3.12-alpine
+              command: ["python3", "/scripts/reap.py"]
+              env:
+                - name: HCLOUD_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hcloud-crabbox-reaper
+                      key: token
+                - name: GRACE_MINUTES
+                  value: "60"
+                - name: IDLE_WINDOW_MINUTES
+                  value: "45"
+                - name: IDLE_CPU_PCT
+                  value: "5.0"
+                - name: HARD_CAP_HOURS
+                  value: "12"
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+          volumes:
+            - name: script
+              configMap:
+                name: crabbox-reaper-script
