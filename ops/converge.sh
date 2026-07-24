@@ -11,7 +11,7 @@
 #   ../crabbox/ops/converge.sh --slug <slug> --lease <cbx_id> \
 #     --bootstrap scripts/crabbox-bootstrap.sh \
 #     --sibling ../dev-tools [--sibling ../other] \
-#     [--gate-job gate]
+#     [--base-ref main] [--gate-job gate]
 #
 # Omit --slug/--lease to warm up a fresh box (class from the repo's
 # .crabbox.yaml). The load-bearing ordering: bootstrap -> siblings ->
@@ -23,66 +23,185 @@ set -euo pipefail
 CRABBOX=${CRABBOX:-crabbox}
 command -v "$CRABBOX" >/dev/null || CRABBOX=~/Applications/crabbox
 
-SLUG="" LEASE="" BOOTSTRAP="" GATE_JOB=""
+SLUG="" LEASE="" BOOTSTRAP="" GATE_JOB="" BASE_REF=""
 SIBLINGS=()
+SIBLING_EXCLUDES=("_build" "deps" ".git" "node_modules")
 while [ $# -gt 0 ]; do
   case "$1" in
     --slug) SLUG=$2; shift 2 ;;
     --lease) LEASE=$2; shift 2 ;;
     --bootstrap) BOOTSTRAP=$2; shift 2 ;;
     --sibling) SIBLINGS+=("$2"); shift 2 ;;
+    --base-ref) BASE_REF=$2; shift 2 ;;
     --gate-job) GATE_JOB=$2; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$BOOTSTRAP" ] || { echo "--bootstrap is required" >&2; exit 2; }
+if { [ -n "$SLUG" ] && [ -z "$LEASE" ]; } || { [ -z "$SLUG" ] && [ -n "$LEASE" ]; }; then
+  echo "--slug and --lease must be supplied together" >&2
+  exit 2
+fi
+
+FRESH_LEASE=0 BUNDLE="" REMOTE_BUNDLE=0 SSH_COMMAND=""
+cleanup_on_exit() {
+  status=$?
+  trap - EXIT
+  if [ -n "$BUNDLE" ]; then rm -f "$BUNDLE" || true; fi
+  if [ "$REMOTE_BUNDLE" -eq 1 ] && [ -n "$SSH_COMMAND" ]; then
+    rssh "rm -f /tmp/seed.bundle" </dev/null >/dev/null 2>&1 || true
+  fi
+  if [ "$status" -ne 0 ] && [ "$FRESH_LEASE" -eq 1 ]; then
+    cleanup_id=${SLUG:-$LEASE}
+    echo "converge failed; stopping fresh lease=$LEASE slug=$SLUG" >&2
+    [ -z "$cleanup_id" ] || "$CRABBOX" stop --id "$cleanup_id" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
 
 if [ -z "$SLUG" ]; then
-  out=$($CRABBOX warmup 2>&1) || { echo "$out"; exit 1; }
+  out=$("$CRABBOX" warmup 2>&1) || { echo "$out"; exit 1; }
+  LEASE=$(printf '%s\n' "$out" | sed -n 's/.*leased \(cbx_[a-z0-9][a-z0-9]*\).*/\1/p' | head -n 1)
+  SLUG=$(printf '%s\n' "$out" | sed -n 's/.*slug=\([a-z0-9-][a-z0-9-]*\).*/\1/p' | head -n 1)
+  FRESH_LEASE=1
+  trap cleanup_on_exit EXIT
   echo "$out" | tail -2
-  LEASE=$(echo "$out" | grep -oP 'leased \Kcbx_[a-z0-9]+' | head -1)
-  SLUG=$(echo "$out" | grep -oP 'slug=\K[a-z-]+' | head -1)
 fi
-[ -n "$LEASE" ] || { echo "--lease required when --slug is given" >&2; exit 2; }
+[ -n "$LEASE" ] && [ -n "$SLUG" ] || { echo "warmup did not report lease and slug" >&2; exit 2; }
+trap cleanup_on_exit EXIT
 echo "converging lease=$LEASE slug=$SLUG"
 
-KEYDIR="$HOME/.config/crabbox/testboxes/$LEASE"
-run_remote() { $CRABBOX run --id "$SLUG" -- "$@"; }
+run_remote() { "$CRABBOX" run --id "$SLUG" -- "$@"; }
 
 echo "== bootstrap =="
 run_remote bash "$BOOTSTRAP"
 
-HOST=$($CRABBOX run --id "$SLUG" -- true 2>&1 | grep -oP 'ssh=crabbox@\K[0-9.]+' | head -1)
-WORKROOT=$($CRABBOX run --id "$SLUG" -- true 2>&1 | grep -oP 'workdir=\K\S+' | head -1)
+WORKROOT=$("$CRABBOX" run --id "$SLUG" --no-sync --no-hydrate -- true 2>&1 |
+  sed -n 's/.*workdir=\([^[:space:]]*\).*/\1/p' | head -n 1)
+case "$WORKROOT" in
+  /*) ;;
+  *) echo "crabbox run did not report an absolute workdir" >&2; exit 2 ;;
+esac
 LEASEROOT=$(dirname "$WORKROOT")
-rssh() { ssh -i "$KEYDIR/id_ed25519" -o UserKnownHostsFile="$KEYDIR/known_hosts" -p 2222 "crabbox@$HOST" "$@"; }
+SSH_COMMAND=$("$CRABBOX" ssh --id "$SLUG")
+rssh() {
+  local command
+  printf -v command '%s %q' "$SSH_COMMAND" "$1"
+  eval "$command"
+}
+rssh_args() {
+  local remote="" quoted arg
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    remote="${remote:+$remote }$quoted"
+  done
+  rssh "$remote"
+}
+stream_sibling_archive() {
+  local sib=$1 name=$2 exclude
+  local args=()
+  for exclude in "${SIBLING_EXCLUDES[@]}"; do args+=(--exclude="$name/$exclude"); done
+  tar -C "$(dirname "$(realpath "$sib")")" -czf - "${args[@]}" "$name"
+}
+sibling_content_hash() {
+  local root temp paths regular_paths hashes manifest exclude path hash kind target size result status
+  local LC_ALL=C
+  local find_excludes=()
+  root=$(realpath "$1")
+  temp=$(mktemp -d "${TMPDIR:-/tmp}/crabbox-sibling-hash.XXXXXX")
+  paths=$temp/paths
+  regular_paths=$temp/regular-paths
+  hashes=$temp/hashes
+  manifest=$temp/manifest
+  for exclude in "${SIBLING_EXCLUDES[@]}"; do
+    [ "${#find_excludes[@]}" -eq 0 ] || find_excludes+=(-o)
+    find_excludes+=(-path "$root/$exclude")
+  done
+  if result=$(
+    set -e
+    find "$root" \( "${find_excludes[@]}" \) -prune -o \( -type f -o -type l \) -print |
+      LC_ALL=C sort >"$paths"
+    while IFS= read -r path; do [ -L "$path" ] || printf '%s\n' "$path"; done \
+      <"$paths" >"$regular_paths"
+    git hash-object --no-filters --stdin-paths <"$regular_paths" >"$hashes"
+    while IFS= read -r path; do
+      if [ -L "$path" ]; then
+        target=$(readlink "$path")
+        size=${#target}
+        printf '%s\0link\0%s\0%s\0' "${path#"$root"/}" "$size" "$target"
+      else
+        IFS= read -r hash <&3
+        [ -x "$path" ] && kind=executable || kind=file
+        printf '%s\0%s\0%s\0' "${path#"$root"/}" "$kind" "$hash"
+      fi
+    done <"$paths" 3<"$hashes" >"$manifest"
+    git hash-object --stdin <"$manifest"
+  ); then
+    status=0
+  else
+    status=$?
+  fi
+  rm -rf "$temp" || true
+  [ "$status" -eq 0 ] || return "$status"
+  printf '%s\n' "$result"
+}
 
 for sib in "${SIBLINGS[@]:-}"; do
   [ -n "$sib" ] || continue
   name=$(basename "$sib")
   echo "== sibling $name =="
-  tar -C "$(dirname "$(realpath "$sib")")" -czf - \
-    --exclude="$name/_build" --exclude="$name/deps" --exclude="$name/.git" \
-    --exclude="$name/node_modules" "$name" | rssh "tar -xzf - -C $LEASEROOT"
+  hash=$(sibling_content_hash "$sib")
+  marker="$LEASEROOT/.crabbox-converge/siblings/$(printf '%s' "$name" | git hash-object --stdin)"
+  if rssh_args bash -c '[ -f "$1" ] && [ "$(cat "$1")" = "$2" ]' _ "$marker" "$hash" >/dev/null; then
+    echo "sibling $name: unchanged, skipping"
+  else
+    echo "sibling $name: placing content"
+    stream_sibling_archive "$sib" "$name" |
+      rssh_args bash -c 'set -e; target=$1; root=$2; marker=$3; hash=$4; name=$5; stage="$root/.crabbox-converge-stage.$$"; backup="$root/.crabbox-converge-backup.$$"; marker_tmp="$marker.tmp.$$"; old=0; swapped=0; rollback() { status=$?; trap - EXIT; set +e; rm -rf "$stage" "$marker_tmp"; if [ "$swapped" -eq 1 ]; then rm -rf "$target"; fi; if [ "$old" -eq 1 ]; then mv "$backup" "$target"; fi; exit "$status"; }; trap rollback EXIT; mkdir "$stage"; tar -xzf - -C "$stage"; test -e "$stage/$name"; if [ -e "$target" ]; then mv "$target" "$backup"; old=1; fi; mv "$stage/$name" "$target"; swapped=1; mkdir -p "$(dirname "$marker")"; printf "%s\n" "$hash" >"$marker_tmp"; mv "$marker_tmp" "$marker"; trap - EXIT; rm -rf "$stage" "$backup" || true' \
+        _ "$LEASEROOT/$name" "$LEASEROOT" "$marker" "$hash" "$name"
+  fi
 done
 
 echo "== git seed =="
-BUNDLE=$(mktemp --suffix=.bundle)
-git bundle create "$BUNDLE" HEAD --branches 2>/dev/null | tail -1 || git bundle create "$BUNDLE" HEAD
-scp -q -i "$KEYDIR/id_ed25519" -o UserKnownHostsFile="$KEYDIR/known_hosts" -P 2222 "$BUNDLE" "crabbox@$HOST:/tmp/seed.bundle"
-rm -f "$BUNDLE"
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-rssh "set -e; cd $WORKROOT; git init -q -b $BRANCH 2>/dev/null || true; \
-  git fetch -q /tmp/seed.bundle $BRANCH:refs/heads/_seed && \
-  git update-ref refs/heads/$BRANCH refs/heads/_seed && \
-  git symbolic-ref HEAD refs/heads/$BRANCH && git branch -D _seed >/dev/null && \
-  git reset -q --mixed $BRANCH && rm -f /tmp/seed.bundle && git log --oneline -1"
+LOCAL_HEAD=$(git rev-parse HEAD)
+BASE_BRANCH=$BASE_REF
+if [ -z "$BASE_BRANCH" ] && git show-ref --verify --quiet refs/heads/main; then
+  BASE_BRANCH=main
+elif [ -n "$BASE_BRANCH" ] && ! git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
+  echo "base ref does not exist: refs/heads/$BASE_BRANCH" >&2
+  exit 2
+fi
+LOCAL_BASE=""
+[ -z "$BASE_BRANCH" ] || LOCAL_BASE=$(git rev-parse --verify "refs/heads/$BASE_BRANCH")
+EXPECTED_CHECKOUT="$BRANCH $LOCAL_HEAD"
+[ -z "$LOCAL_BASE" ] || EXPECTED_CHECKOUT="$EXPECTED_CHECKOUT $LOCAL_BASE"
+REMOTE_CHECKOUT=$(rssh_args bash -c 'cd "$1" && branch=$(git symbolic-ref --short HEAD 2>/dev/null) && head=$(git rev-parse HEAD 2>/dev/null) && base="" && { [ -z "$2" ] || base=$(git rev-parse "refs/heads/$2" 2>/dev/null || true); } && printf "%s %s" "$branch" "$head" && { [ -z "$base" ] || printf " %s" "$base"; } && printf "\n"' \
+  _ "$WORKROOT" "$BASE_BRANCH" || true)
+if [ "$REMOTE_CHECKOUT" = "$EXPECTED_CHECKOUT" ]; then
+  echo "git seed: unchanged, skipping"
+else
+  echo "git seed: placing $LOCAL_HEAD"
+  BUNDLE=$(mktemp "${TMPDIR:-/tmp}/crabbox-converge.XXXXXX")
+  BUNDLE_REFS=("refs/heads/$BRANCH")
+  if [ -n "$LOCAL_BASE" ] && [ "$BASE_BRANCH" != "$BRANCH" ]; then
+    BUNDLE_REFS+=("refs/heads/$BASE_BRANCH")
+  fi
+  git bundle create "$BUNDLE" "${BUNDLE_REFS[@]}"
+  REMOTE_BUNDLE=1
+  rssh "cat > /tmp/seed.bundle" <"$BUNDLE"
+  rm -f "$BUNDLE"
+  BUNDLE=""
+  rssh_args bash -c 'set -e; cd "$1"; git init -q -b "$2" 2>/dev/null || true; git fetch -q /tmp/seed.bundle "$2"; git update-ref "refs/heads/$2" FETCH_HEAD; if [ -n "$5" ] && [ "$2" != "$4" ]; then git fetch -q /tmp/seed.bundle "$4"; git update-ref "refs/heads/$4" FETCH_HEAD; fi; git symbolic-ref HEAD "refs/heads/$2"; git reset -q --mixed "$2"; test "$(git rev-parse HEAD)" = "$3"; rm -f /tmp/seed.bundle; git log --oneline -1' \
+    _ "$WORKROOT" "$BRANCH" "$LOCAL_HEAD" "$BASE_BRANCH" "$LOCAL_BASE"
+  REMOTE_BUNDLE=0
+fi
 
 echo "== deps.get (with siblings present) =="
-run_remote bash -lc "mix deps.get" >/dev/null 2>&1 || run_remote bash -lc "mix deps.get"
+"$CRABBOX" run --id "$SLUG" --no-sync --no-hydrate -- bash -lc "mix deps.get"
 
 if [ -n "$GATE_JOB" ]; then
   echo "== gate job: $GATE_JOB =="
-  $CRABBOX job run "$GATE_JOB" --id "$SLUG"
+  "$CRABBOX" job run --id "$SLUG" "$GATE_JOB"
 fi
 echo "converged. release with: $CRABBOX stop --id $SLUG"
