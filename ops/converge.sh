@@ -60,7 +60,14 @@ cleanup_on_exit() {
 }
 
 if [ -z "$SLUG" ]; then
-  out=$("$CRABBOX" warmup 2>&1) || { echo "$out"; exit 1; }
+  # Session-length lease parameters, tuned from 2026-07-25 telemetry: the
+  # 1h30m default TTL killed an active box mid-Reach, and the 30m idle
+  # default caused 5 avoidable re-converges in 2 days (boxes needed again
+  # 10-52 min after reaping). Idle cost is ~$0.29/h; a re-converge costs
+  # 6-7 min of blocked agent time. Override per session for smaller plans.
+  WARMUP_TTL="${CRABBOX_TTL:-8h}"
+  WARMUP_IDLE="${CRABBOX_IDLE:-90m}"
+  out=$("$CRABBOX" warmup --ttl "$WARMUP_TTL" --idle-timeout "$WARMUP_IDLE" 2>&1) || { echo "$out"; exit 1; }
   LEASE=$(printf '%s\n' "$out" | sed -n 's/.*leased \(cbx_[a-z0-9][a-z0-9]*\).*/\1/p' | head -n 1)
   SLUG=$(printf '%s\n' "$out" | sed -n 's/.*slug=\([a-z0-9-][a-z0-9-]*\).*/\1/p' | head -n 1)
   FRESH_LEASE=1

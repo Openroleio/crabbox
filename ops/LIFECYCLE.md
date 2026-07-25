@@ -34,11 +34,15 @@ script, a `.crabbox.yaml`, and a thin wrapper gets the same lifecycle.
    green — run the wrapper's `ensure` in parallel with the final
    simplify/review pass so the converge overlaps review and the box is
    warm at the gate. Never lease during initial implementation or
-   otherwise in anticipation: an idle box is reaped ~30 min after its
-   last run, and a box converged early is a converge wasted (observed
-   2026-07-24 — two boxes reaped before their first gate). Keep the
-   local work between `ensure` and the first remote run inside that
-   idle window.
+   otherwise in anticipation: an idle box is reaped after its idle
+   window, and a box converged early is a converge wasted (observed
+   2026-07-24 — two boxes reaped before their first gate). Lane leases
+   are created with `--ttl 8h --idle-timeout 90m` (converge.sh;
+   override via CRABBOX_TTL / CRABBOX_IDLE). Provisional values from
+   2026-07-25 telemetry: the 1h30m default TTL killed an active box
+   mid-Reach, and the 30m idle default caused 5 avoidable re-converges
+   in 2 days — revisit as shorter plans arrive; non-lane leases keep
+   the 30m coordinator default.
 4. **The box serves the whole session.** The wrapper records it
    (`.crabbox/box`), health-checks before reuse, and every
    `gate`/`contracts`/`run` syncs the dirty diff (~1.5s) and executes.
