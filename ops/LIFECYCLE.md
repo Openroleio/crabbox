@@ -30,10 +30,15 @@ script, a `.crabbox.yaml`, and a thin wrapper gets the same lifecycle.
    `ops/converge.sh` makes it test-ready: idempotent bootstrap →
    sibling repos → git-bundle seed → `deps.get` (MUST re-run after
    siblings: conditional path deps) → optional gate. Cold ≈ 10 min,
-   once per box. Lease only when a remote run is imminent (minutes
-   away), never in anticipation: an idle box is reaped ~30 min after
-   its last run, and a box converged early is a converge wasted
-   (observed 2026-07-24 — two boxes reaped before their first gate).
+   once per box. Best launch point: code-complete with focused tests
+   green — run the wrapper's `ensure` in parallel with the final
+   simplify/review pass so the converge overlaps review and the box is
+   warm at the gate. Never lease during initial implementation or
+   otherwise in anticipation: an idle box is reaped ~30 min after its
+   last run, and a box converged early is a converge wasted (observed
+   2026-07-24 — two boxes reaped before their first gate). Keep the
+   local work between `ensure` and the first remote run inside that
+   idle window.
 4. **The box serves the whole session.** The wrapper records it
    (`.crabbox/box`), health-checks before reuse, and every
    `gate`/`contracts`/`run` syncs the dirty diff (~1.5s) and executes.
