@@ -208,7 +208,10 @@ func (c *spritesClient) ListSprites(ctx context.Context, prefix string) ([]sprit
 		}
 		next := strings.TrimSpace(page.NextContinuationToken)
 		if next == "" {
-			return nil, fmt.Errorf("sprites list response has_more without next_continuation_token")
+			// The live API (observed 2026-07-26) reports has_more=true with a
+			// null continuation token on a complete single-page listing; an
+			// empty token means there is nothing more to fetch.
+			return all, nil
 		}
 		if seenContinuations[next] {
 			return nil, fmt.Errorf("sprites list response repeated continuation token %q", next)

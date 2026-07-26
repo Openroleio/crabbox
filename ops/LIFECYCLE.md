@@ -59,8 +59,14 @@ script, a `.crabbox.yaml`, and a thin wrapper gets the same lifecycle.
    gates always local.
 6. **Session end.** Clean exit → launcher trap stops the lease and
    clears state (single owner per worktree assumed). Any other death →
-   the coordinator reaps the idle box ~30 min after its last run
-   (verified live). The monthly spend cap bounds the worst case.
+   `ops/sweep-orphans.sh` (systemd user timer, every 10 min) stops any
+   box whose owning worktree has no live process — added 2026-07-26
+   after the shakedown showed 13/36 leases dying unreleased, each
+   burning the full 90m idle window (~44% of the period's spend). The
+   coordinator's idle reaper and the monthly spend cap remain the
+   backstops. Manually-warmed boxes (no `.crabbox/box` state) are
+   outside the sweeper's reach: it logs them to `~/.crabbox-sweep.log`
+   but never stops them — release spike boxes yourself.
 7. **Oversight.** Both developers are coordinator admins: every lease,
    run log, and the spend ledger are in the portal
    (`<coordinator>/portal`).
