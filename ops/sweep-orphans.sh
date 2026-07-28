@@ -17,7 +17,8 @@
 # Static-host lanes (the office box) never reach a coordinator idle reaper at
 # all: nothing bills them, so nothing stops them, and their claim files under
 # the crabbox state dir outlive the worktree state file they were created for.
-# A second pass reaps those orphaned claims directly.
+# A second pass reaps those orphaned claims directly: expired past their own
+# idleTimeoutSeconds, with no crabbox process naming the slug.
 #
 #   SWEEP_ROOTS   space-separated dirs whose children are scanned for
 #                 .crabbox/box and .crabbox/box-office state files
@@ -52,6 +53,67 @@ worktree_live() {
   while IFS= read -r cwd; do
     case "$cwd" in "$wt"|"$wt"/*) return 0 ;; esac
   done < <(readlink /proc/[0-9]*/cwd 2>/dev/null)
+  return 1
+}
+
+worktree_cwd_count() {
+  local wt=$1 cwd n=0
+  while IFS= read -r cwd; do
+    case "$cwd" in "$wt"|"$wt"/*) n=$((n + 1)) ;; esac
+  done < <(readlink /proc/[0-9]*/cwd 2>/dev/null)
+  printf '%s\n' "$n"
+}
+
+# Is any live process actually working on this lease?
+#
+# A cwd inside the worktree is far too loose for a lease: a parked shell or a
+# long-lived agent session pins it forever. The precise signal is a crabbox
+# invocation naming the slug, so a process counts as in-use only when its full
+# argv satisfies both halves:
+#
+#   1. it mentions "crabbox" somewhere — the CLI itself, the ops/converge.sh
+#      path it is launched from, or a crabbox-work/crabbox-ssh path in the
+#      remote command. This is what keeps an unrelated process whose argv
+#      merely happens to carry the slug text from counting as in-use.
+#   2. one of its argv elements carries the slug as an argument: the element
+#      holds no whitespace, and the slug within it is not flanked by
+#      [A-Za-z0-9_-]. Both halves of that matter.
+#
+#      The no-whitespace test rejects an element that is a script body rather
+#      than an argument. A shell invoked as `bash -c '<script>'` carries the
+#      whole script as one element, and any script that greps the claims dir
+#      mentions both "crabbox" and every slug in it — an agent session running
+#      one would otherwise pin every claim on the box. Real slug-bearing
+#      arguments never contain whitespace: `--slug`, `office-ge-track-c`,
+#      `/home/jesse/crabbox-work/office-ge-track-c`. A remote ssh command line
+#      is one huge whitespace-bearing element and is skipped, but the crabbox
+#      or converge.sh parent that spawned it always carries the short form, so
+#      in-flight work is still seen.
+#
+#      The delimiter test keeps nested slugs apart. They nest as plain prefixes
+#      (office-ge, office-ge-track-b, office-ge-track-b-755), so a substring
+#      test would let a converge for office-ge-track-b-755 pin
+#      office-ge-track-b forever.
+#
+# Our own PID is skipped so the sweeper can never see itself as the worker.
+slug_in_use() {
+  local slug=$1 proc pid cmd arg args pattern
+  # Slugs are [a-z0-9-], but escape regex metacharacters anyway.
+  pattern="(^|[^A-Za-z0-9_-])$(printf '%s' "$slug" | sed 's/[][\\.^$*+?(){}|]/\\&/g')($|[^A-Za-z0-9_-])"
+  for proc in /proc/[0-9]*; do
+    pid=${proc#/proc/}
+    [ "$pid" = "$$" ] && continue
+    [ -r "$proc/cmdline" ] || continue
+    args=()
+    mapfile -t -d '' args < "$proc/cmdline" 2>/dev/null || continue
+    [ ${#args[@]} -gt 0 ] || continue
+    cmd="${args[*]}"
+    case "$cmd" in *crabbox*) ;; *) continue ;; esac
+    for arg in "${args[@]}"; do
+      case "$arg" in *[[:space:]]*) continue ;; esac
+      [[ $arg =~ $pattern ]] && return 0
+    done
+  done
   return 1
 }
 
@@ -99,12 +161,19 @@ done
 #
 # A static-lane claim outlives its .crabbox/box-office file whenever the
 # launcher dies between converge and release, and no coordinator reaper exists
-# for a static host, so the claim pins the lane forever. Reaping requires a
-# dead owner: no live process with its cwd inside the claim's recorded
-# repoRoot. The recorded idleTimeoutSeconds is logged as context but is never
-# sufficient on its own, because lastUsedAt is refreshed only when the lease is
-# (re)claimed — a single long converge or test run holds it still for its whole
-# duration, so an idle-looking claim can be actively working.
+# for a static host, so the claim pins the lane forever.
+#
+# Reaping requires a dead owner plus an expired lease: no crabbox process names
+# the slug (see slug_in_use), and lastUsedAt is older than the claim's own
+# idleTimeoutSeconds. The idle test is only safe because the in-use test is
+# precise — lastUsedAt is written when the lease is (re)claimed and never
+# refreshed during an operation, so a converge or gate that outruns the idle
+# timeout looks idle the whole time and is saved solely by slug_in_use.
+#
+# The cwd-process count is logged for forensics but no longer blocks a reap:
+# agent sessions park a cwd in these worktrees indefinitely, which is exactly
+# what kept expired claims pinned. It is still the fallback rule for a claim
+# that records no positive idleTimeoutSeconds, where no idle test exists.
 claims_dir() {
   local dir
   if [ -n "${SWEEP_CLAIMS_DIR:-}" ]; then printf '%s\n' "$SWEEP_CLAIMS_DIR"; return 0; fi
@@ -137,18 +206,31 @@ if [ -n "$CLAIMS_DIR" ] && command -v jq >/dev/null 2>&1; then
     # The state-file pass owns worktrees that still have a state file; this
     # pass only cleans up after it.
     [ -n "$wt" ] && [ -f "$wt/.crabbox/box-office" ] && continue
-    [ -n "$wt" ] && worktree_live "$wt" && continue
 
+    # In-flight crabbox work on this slug always wins, whatever the clock says.
+    in_use=no
+    slug_in_use "$slug" && in_use=yes
     expired=no
     [ "${idle_timeout:-0}" -gt 0 ] && [ "$idle" -ge "$idle_timeout" ] && expired=yes
-    detail="slug=$slug wt=${wt:-none} idle=${idle}s timeout=${idle_timeout}s expired=$expired"
+    cwd_procs=0
+    [ -n "$wt" ] && cwd_procs=$(worktree_cwd_count "$wt")
+    detail="slug=$slug wt=${wt:-none} idle=${idle}s timeout=${idle_timeout}s expired=$expired in_use=$in_use cwd_procs=$cwd_procs"
+    [ "$in_use" = yes ] && continue
+    if [ "${idle_timeout:-0}" -gt 0 ]; then
+      [ "$expired" = yes ] || continue
+    else
+      # No idle timeout recorded: fall back to the old cwd-liveness rule rather
+      # than reaping on the grace window alone.
+      [ "$cwd_procs" -eq 0 ] || continue
+    fi
+
     if [ "$DRY_RUN" = 1 ]; then
-      log "would-sweep claim $detail (no live session)"
+      log "would-sweep claim $detail"
       swept=$((swept + 1))
       continue
     fi
     if "$CRABBOX" stop --id "$slug" >/dev/null 2>&1; then
-      log "swept claim $detail (no live session)"
+      log "swept claim $detail"
     else
       log "stop-failed claim $detail (already reaped?)"
     fi
