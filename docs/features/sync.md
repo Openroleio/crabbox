@@ -83,7 +83,14 @@ For an SSH-lease run, sync runs these steps:
 2. Build the sync manifest (the NUL-delimited file list) and a parallel list of
    tracked paths that were deleted locally.
 3. Print a candidate estimate and, when the checkout is dirty, a dirty-delta
-   estimate; then enforce the large-sync guardrails (see below).
+   estimate; then enforce the large-sync guardrails (see below) and the
+   mass-deletion guard: if the local checkout carries 200 or more uncommitted
+   tracked deletions (staged or unstaged), Crabbox prints a warning naming the
+   count and a sample of the paths, then syncs them anyway. Large renames and
+   language migrations routinely cross that line, so the deletions are
+   propagated by default. Set `CRABBOX_BLOCK_MASS_DELETIONS=1` to abort the
+   sync (exit 6) instead, and `CRABBOX_ALLOW_MASS_DELETIONS=1` to silence the
+   warning entirely.
 4. When fingerprinting is enabled, compute a local fingerprint and compare it to
    the remote one. If they match, print
    `No changes detected, skipping sync` and skip the rest.
@@ -96,14 +103,18 @@ For an SSH-lease run, sync runs these steps:
 9. rsync the working set with `--files-from=- --from0` (the manifest drives the
    transfer).
 10. Finalize: git-hydrate the worktree against the configured base ref, run the
-    mass-deletion sanity check, and record the new fingerprint.
+    sync integrity check, and record the new fingerprint.
 
 The remote prune in step 8 only removes paths Crabbox previously synced. It does
 not touch workflow-created state, package caches, `.git`, or any other runner
-file outside the managed list. The mass-deletion guard in step 10 aborts a sync
-that would delete an unexpectedly large fraction of tracked files; set
-`CRABBOX_ALLOW_MASS_DELETIONS=1` to override it (this is also implied during
-Actions hydration).
+file outside the managed list. The integrity check in step 10 verifies that the
+paths listed in the freshly synced manifest actually exist in the remote working
+tree and aborts (exit 66) when 200 or more are missing. It deliberately ignores
+Git state on the runner: a branch that legitimately deletes many tracked files
+(a large rename or migration) is ordinary branch shape, not a sync failure, and
+the runner's Git checkout may lag far behind the synced candidate. Set
+`CRABBOX_ALLOW_MASS_DELETIONS=1` to override this check and silence the local
+mass-deletion warning (this is also implied during Actions hydration).
 
 On the remote box, sync metadata (including the fingerprint) is stored under
 `.git/crabbox` when `.git` is a directory, and under `.crabbox` otherwise. The
@@ -206,6 +217,7 @@ CRABBOX_SYNC_FAIL_FILES
 CRABBOX_SYNC_FAIL_BYTES
 CRABBOX_SYNC_ALLOW_LARGE
 CRABBOX_ALLOW_MASS_DELETIONS
+CRABBOX_BLOCK_MASS_DELETIONS
 CRABBOX_ENV_ALLOW
 ```
 

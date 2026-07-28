@@ -1726,13 +1726,17 @@ new="$meta_dir/sync-manifest.new"
 deleted="$meta_dir/sync-deleted.new"
 rm -f "$deleted"
 mv "$new" "$meta_dir/sync-manifest"
-if test -d .git && git status --short >/tmp/crabbox-git-status 2>/dev/null; then
-  deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' /tmp/crabbox-git-status)
-  if [ ` + shellQuote(allowValue) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
-    echo "remote sync sanity failed: $deletions tracked deletions" >&2
-    awk '/^ D|^D / { print "  " substr($0,4) }' /tmp/crabbox-git-status | head -20 >&2
+if [ ` + shellQuote(allowValue) + ` != '1' ]; then
+  missing_list="$meta_dir/sync-missing.tmp"
+  xargs -0 sh -c 'for f in "$@"; do [ -e "$f" ] || [ -L "$f" ] || printf "%s\n" "$f"; done' sh < "$meta_dir/sync-manifest" > "$missing_list"
+  missing=$(wc -l < "$missing_list" | tr -d "[:space:]")
+  if [ "$missing" -ge ` + strconv.Itoa(syncMassDeletionThreshold) + ` ]; then
+    echo "remote sync sanity failed: $missing synced paths missing from the working tree" >&2
+    sed "s/^/  /" "$missing_list" | head -20 >&2
+    rm -f "$missing_list"
     exit 66
   fi
+  rm -f "$missing_list"
 fi
 `
 	if opts.HydrateGit && opts.BaseRef != "" {
@@ -1755,22 +1759,6 @@ fi
 
 func remoteSyncMetaDirScript() string {
 	return "meta_dir=$(if [ -d .git ]; then printf %s .git/crabbox; else printf %s .crabbox; fi); "
-}
-
-func remoteSyncSanity(workdir string, allowMassDeletions bool) string {
-	allowValue := ""
-	if allowMassDeletions {
-		allowValue = "1"
-	}
-	return "cd " + shellQuote(workdir) + " && " +
-		"if test -d .git && git status --short >/tmp/crabbox-git-status 2>/dev/null; then " +
-		"deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' /tmp/crabbox-git-status); " +
-		"if [ " + shellQuote(allowValue) + " != '1' ] && [ \"$deletions\" -ge 200 ]; then " +
-		"echo \"remote sync sanity failed: $deletions tracked deletions\" >&2; " +
-		"awk '/^ D|^D / { print \"  \" substr($0,4) }' /tmp/crabbox-git-status | head -20 >&2; " +
-		"exit 66; " +
-		"fi; " +
-		"fi"
 }
 
 func exitCode(err error) int {

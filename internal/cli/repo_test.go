@@ -832,6 +832,83 @@ func TestCheckSyncPreflightUsesDirtyDeltaForDeletions(t *testing.T) {
 	}
 }
 
+func massDeletionPaths(n int) []string {
+	deleted := make([]string, n)
+	for i := range deleted {
+		deleted[i] = fmt.Sprintf("lost/file-%03d.txt", i)
+	}
+	return deleted
+}
+
+func TestCheckSyncPreflightWarnsOnMassUncommittedDeletions(t *testing.T) {
+	cfg := baseConfig()
+	t.Setenv("CRABBOX_ALLOW_MASS_DELETIONS", "")
+	t.Setenv("CRABBOX_BLOCK_MASS_DELETIONS", "")
+	var stderr bytes.Buffer
+	err := checkSyncPreflight(SyncManifest{Files: []string{"a"}, Deleted: massDeletionPaths(syncMassDeletionThreshold)}, cfg, false, &stderr)
+	if err != nil {
+		t.Fatalf("mass uncommitted deletions should warn, not fail: %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, fmt.Sprintf("warning: sync is propagating %d uncommitted tracked deletions", syncMassDeletionThreshold)) {
+		t.Fatalf("missing mass-deletion warning: %q", got)
+	}
+	if !strings.Contains(got, "CRABBOX_BLOCK_MASS_DELETIONS=1") {
+		t.Fatalf("warning should mention the opt-in block env: %q", got)
+	}
+	if !strings.Contains(got, "  lost/file-000.txt") {
+		t.Fatalf("missing deletion sample: %q", got)
+	}
+}
+
+func TestCheckSyncPreflightBlocksMassDeletionsWhenOptedIn(t *testing.T) {
+	cfg := baseConfig()
+	t.Setenv("CRABBOX_ALLOW_MASS_DELETIONS", "")
+	t.Setenv("CRABBOX_BLOCK_MASS_DELETIONS", "1")
+	var stderr bytes.Buffer
+	err := checkSyncPreflight(SyncManifest{Files: []string{"a"}, Deleted: massDeletionPaths(syncMassDeletionThreshold)}, cfg, false, &stderr)
+	if err == nil {
+		t.Fatal("expected CRABBOX_BLOCK_MASS_DELETIONS=1 to fail preflight")
+	}
+	if !strings.Contains(err.Error(), "uncommitted tracked deletions") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unset CRABBOX_BLOCK_MASS_DELETIONS") {
+		t.Fatalf("error should hint at unsetting the opt-in env: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "  lost/file-000.txt") {
+		t.Fatalf("missing deletion sample: %q", stderr.String())
+	}
+}
+
+func TestCheckSyncPreflightAllowEnvSuppressesMassDeletionWarningAndBlock(t *testing.T) {
+	cfg := baseConfig()
+	t.Setenv("CRABBOX_BLOCK_MASS_DELETIONS", "1")
+	t.Setenv("CRABBOX_ALLOW_MASS_DELETIONS", "1")
+	var stderr bytes.Buffer
+	many := massDeletionPaths(syncMassDeletionThreshold)
+	if err := checkSyncPreflight(SyncManifest{Files: []string{"a"}, Deleted: many}, cfg, false, &stderr); err != nil {
+		t.Fatalf("CRABBOX_ALLOW_MASS_DELETIONS=1 should pass: %v", err)
+	}
+	if strings.Contains(stderr.String(), "uncommitted tracked deletions") {
+		t.Fatalf("CRABBOX_ALLOW_MASS_DELETIONS=1 should silence the warning: %q", stderr.String())
+	}
+}
+
+func TestCheckSyncPreflightQuietBelowMassDeletionThreshold(t *testing.T) {
+	cfg := baseConfig()
+	t.Setenv("CRABBOX_ALLOW_MASS_DELETIONS", "")
+	t.Setenv("CRABBOX_BLOCK_MASS_DELETIONS", "")
+	var stderr bytes.Buffer
+	few := massDeletionPaths(syncMassDeletionThreshold - 1)
+	if err := checkSyncPreflight(SyncManifest{Files: []string{"a"}, Deleted: few}, cfg, false, &stderr); err != nil {
+		t.Fatalf("below-threshold deletions should pass: %v", err)
+	}
+	if strings.Contains(stderr.String(), "uncommitted tracked deletions") {
+		t.Fatalf("below-threshold deletions should not warn: %q", stderr.String())
+	}
+}
+
 func TestHumanBytes(t *testing.T) {
 	if got := humanBytes(1536); got != "1.5 KiB" {
 		t.Fatalf("humanBytes=%q", got)

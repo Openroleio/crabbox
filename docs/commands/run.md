@@ -170,9 +170,14 @@ when possible, and uploads the checkout from scratch. Use `--checksum` for a
 paranoid checksum scan instead of size/time comparison, and `--debug` to print
 sync timing, progress, and itemized rsync output.
 
-After sync, Crabbox runs a remote sanity check. If the remote checkout reports
-at least 200 tracked deletions, the run fails before the command unless local
-`CRABBOX_ALLOW_MASS_DELETIONS=1` is set.
+Before sync, Crabbox counts the uncommitted tracked deletions in the local
+checkout. At 200 or more it warns and syncs them anyway; set
+`CRABBOX_BLOCK_MASS_DELETIONS=1` to abort the run instead, or
+`CRABBOX_ALLOW_MASS_DELETIONS=1` to silence the warning.
+
+After sync, Crabbox runs a remote sanity check. If at least 200 paths from the
+freshly synced manifest are missing from the remote working tree, the run fails
+before the command unless local `CRABBOX_ALLOW_MASS_DELETIONS=1` is set.
 
 Project-specific excludes live in `.crabboxignore` or `sync.exclude` in
 `crabbox.yaml` / `.crabbox.yaml`. See [sync](../features/sync.md). Use

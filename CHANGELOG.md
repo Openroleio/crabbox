@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Reworked the post-sync mass-deletion sanity check so a candidate that legitimately deletes many tracked files (for example a large rename or language migration) no longer aborts the sync on runners whose Git checkout lags behind the synced tree. The remote check now verifies that freshly synced manifest paths exist in the working tree instead of counting `git status` deletions against a possibly stale `HEAD`. `CRABBOX_ALLOW_MASS_DELETIONS=1` still overrides it.
+
+### Changed
+
+- The local pre-transfer mass-deletion guard now warns and proceeds instead of aborting: a sync carrying 200 or more uncommitted tracked deletions prints `warning: sync is propagating N uncommitted tracked deletions` with a sample of the paths and continues. Set `CRABBOX_BLOCK_MASS_DELETIONS=1` to restore the abort (exit 6); `CRABBOX_ALLOW_MASS_DELETIONS=1` remains recognized and suppresses the warning entirely.
+
 ## 0.40.1 - 2026-07-23
 
 ### Added

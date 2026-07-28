@@ -646,6 +646,28 @@ func safeRepoRel(rel string) bool {
 	return true
 }
 
+// syncMassDeletionThreshold bounds how many tracked-but-missing paths a sync
+// may propagate before it aborts: locally as uncommitted deletions in the
+// manifest, remotely as manifest paths absent after transfer. Committed
+// deletions never count against it; they are ordinary branch shape.
+const syncMassDeletionThreshold = 200
+
+// allowSyncMassDeletions reports whether the operator silenced the
+// mass-deletion guard outright. It predates the warn-by-default behavior and
+// stays recognized for backward compatibility: when set it suppresses both the
+// warning and any opt-in blocking.
+func allowSyncMassDeletions() bool {
+	return os.Getenv("CRABBOX_ALLOW_MASS_DELETIONS") == "1"
+}
+
+// blockSyncMassDeletions reports whether the operator opted in to aborting a
+// sync that would propagate a mass deletion. The default is to warn and
+// proceed; legitimate large renames and language migrations are ordinary
+// branch shape, not a sync failure.
+func blockSyncMassDeletions() bool {
+	return os.Getenv("CRABBOX_BLOCK_MASS_DELETIONS") == "1" && !allowSyncMassDeletions()
+}
+
 func checkSyncPreflight(manifest SyncManifest, cfg Config, force bool, stderr io.Writer) error {
 	fileCount := len(manifest.Files)
 	guard := evaluateSyncGuardrail(manifest, cfg, force)
@@ -663,6 +685,22 @@ func checkSyncPreflight(manifest SyncManifest, cfg Config, force bool, stderr io
 			return exit(6, "sync %s too large: %d files >= limit %d; use --force-sync-large or CRABBOX_SYNC_ALLOW_LARGE=1", guard.Scope, reason.Actual, reason.Limit)
 		}
 		return exit(6, "sync %s too large: %s >= limit %s; use --force-sync-large or CRABBOX_SYNC_ALLOW_LARGE=1", guard.Scope, humanBytes(reason.Actual), humanBytes(reason.Limit))
+	}
+	if len(manifest.Deleted) >= syncMassDeletionThreshold && !allowSyncMassDeletions() {
+		sample := manifest.Deleted
+		if len(sample) > 20 {
+			sample = sample[:20]
+		}
+		if blockSyncMassDeletions() {
+			for _, rel := range sample {
+				fmt.Fprintf(stderr, "  %s\n", rel)
+			}
+			return exit(6, "sync would propagate %d uncommitted tracked deletions; commit or restore them, or unset CRABBOX_BLOCK_MASS_DELETIONS to sync them anyway", len(manifest.Deleted))
+		}
+		fmt.Fprintf(stderr, "warning: sync is propagating %d uncommitted tracked deletions; set CRABBOX_BLOCK_MASS_DELETIONS=1 to abort instead, or CRABBOX_ALLOW_MASS_DELETIONS=1 to silence this warning\n", len(manifest.Deleted))
+		for _, rel := range sample {
+			fmt.Fprintf(stderr, "  %s\n", rel)
+		}
 	}
 	warned := false
 	for _, reason := range guard.Reasons {

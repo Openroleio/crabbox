@@ -2444,16 +2444,86 @@ func TestAWSRegionAndAvailabilityZoneCandidates(t *testing.T) {
 	}
 }
 
-func TestRemoteSyncSanityReportsDeletionSample(t *testing.T) {
-	got := remoteSyncSanity("/work/repo", false)
-	for _, want := range []string{
-		"remote sync sanity failed: $deletions tracked deletions",
-		`awk '/^ D|^D / { print "  " substr($0,4) }'`,
-		"head -20",
-		"exit 66",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("remoteSyncSanity() missing %q in %q", want, got)
+func writeFinalizeManifest(t *testing.T, workdir string, paths []string) string {
+	t.Helper()
+	metaDir := filepath.Join(workdir, ".crabbox")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var manifest bytes.Buffer
+	for _, rel := range paths {
+		manifest.WriteString(rel)
+		manifest.WriteByte(0)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, "sync-manifest.new"), manifest.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return metaDir
+}
+
+func TestRemoteFinalizeSyncFailsWhenManifestPathsMissing(t *testing.T) {
+	workdir := t.TempDir()
+	paths := make([]string, syncMassDeletionThreshold)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("missing/path-%03d.txt", i)
+	}
+	writeFinalizeManifest(t, workdir, paths)
+
+	cmd := exec.Command("bash", "-lc", remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{}))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected finalize to fail, output: %s", out)
+	}
+	if code := exitCode(err); code != 66 {
+		t.Fatalf("exit code = %d, want 66; output: %s", code, out)
+	}
+	want := fmt.Sprintf("remote sync sanity failed: %d synced paths missing from the working tree", syncMassDeletionThreshold)
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("missing %q in output: %s", want, out)
+	}
+	if !strings.Contains(string(out), "  missing/path-000.txt") {
+		t.Fatalf("missing path sample in output: %s", out)
+	}
+}
+
+func TestRemoteFinalizeSyncPassesWhenManifestPathsExist(t *testing.T) {
+	// A candidate that deletes many tracked files (e.g. a large rename or
+	// migration) must not trip the sanity check: only paths the manifest
+	// claims to have synced are verified, not git state.
+	workdir := t.TempDir()
+	paths := make([]string, syncMassDeletionThreshold)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("present/path-%03d.txt", i)
+	}
+	if err := os.MkdirAll(filepath.Join(workdir, "present"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range paths {
+		if err := os.WriteFile(filepath.Join(workdir, filepath.FromSlash(rel)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
 		}
+	}
+	metaDir := writeFinalizeManifest(t, workdir, paths)
+
+	cmd := exec.Command("bash", "-lc", remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{}))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("finalize failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(metaDir, "sync-missing.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("missing-list scratch file should be removed, stat err=%v", err)
+	}
+}
+
+func TestRemoteFinalizeSyncAllowMassDeletionsSkipsCheck(t *testing.T) {
+	workdir := t.TempDir()
+	paths := make([]string, syncMassDeletionThreshold)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("missing/path-%03d.txt", i)
+	}
+	writeFinalizeManifest(t, workdir, paths)
+
+	cmd := exec.Command("bash", "-lc", remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{AllowMassDeletions: true}))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("finalize with AllowMassDeletions failed: %v\n%s", err, out)
 	}
 }
