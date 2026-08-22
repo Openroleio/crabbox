@@ -25,10 +25,10 @@ function fixture(branch = "test") {
 printf 'transport argc=%s command=%s\\n' "$#" "$*" >>"$CRABBOX_TEST_LOG"
 if [[ "$#" != 1 ]]; then exit 43; fi
 if [[ "$1" == 'cat > /tmp/seed.bundle' ]]; then
-  if [[ "\${CRABBOX_TEST_EXEC_REMOTE:-0}" == 1 ]]; then
-    exec bash -c "$1"
-  fi
   cat >"$CRABBOX_TEST_STATE/uploaded.bundle"
+  if [[ "\${CRABBOX_TEST_EXEC_REMOTE:-0}" == 1 ]]; then
+    cp "$CRABBOX_TEST_STATE/uploaded.bundle" /tmp/seed.bundle
+  fi
   exit
 fi
 eval "set -- $1"
@@ -36,6 +36,10 @@ script="\${3:-}"
 if [[ "\${CRABBOX_TEST_EXEC_REMOTE:-0}" == 1 ]]; then
   if [[ "$script" == *'tar -xzf'* && "\${CRABBOX_TEST_FAIL_MARKER:-0}" == 1 ]]; then
     mkdir -p "\${7}.tmp.$$"
+  fi
+  if [[ "$script" == *'mktemp "$target.tmp.XXXXXX"'* && "\${CRABBOX_TEST_FAIL_CONFIG_TRANSFER:-0}" == 1 ]]; then
+    head -c 1 | "$@"
+    exit $?
   fi
   exec "$@"
 fi
@@ -59,6 +63,10 @@ if [[ "$script" == *'git symbolic-ref --short'* ]]; then
       read -r remote_base <"$CRABBOX_TEST_STATE/remote-base"
       printf ' %s' "$remote_base"
     fi
+    if [[ -n "\${7:-}" && -f "$CRABBOX_TEST_STATE/remote-origin" ]]; then
+      read -r remote_origin <"$CRABBOX_TEST_STATE/remote-origin"
+      printf ' %s' "$remote_origin"
+    fi
     printf '\\n'
   fi
   exit
@@ -74,6 +82,9 @@ if [[ "$script" == *'git fetch -q'* ]]; then
   printf '%s\\n' "\${7:-}" >"$CRABBOX_TEST_STATE/remote-head"
   if [[ -n "\${9:-}" ]]; then
     printf '%s\\n' "\${9:-}" >"$CRABBOX_TEST_STATE/remote-base"
+  fi
+  if [[ -n "\${10:-}" ]]; then
+    printf '%s\\n' "\${10:-}" >"$CRABBOX_TEST_STATE/remote-origin"
   fi
   exit
 fi
@@ -116,12 +127,12 @@ esac
   return { dir, log, state, transport, cli };
 }
 
-function invoke(f, extraArgs = [], env = {}) {
+function invoke(f, extraArgs = [], env = {}, cwd = f.dir) {
   return spawnSync(
     "bash",
     [path.join(repoRoot, "ops/converge.sh"), "--bootstrap", "bootstrap.sh", ...extraArgs],
     {
-      cwd: f.dir,
+      cwd,
       encoding: "utf8",
       env: {
         ...process.env,
@@ -136,6 +147,60 @@ function invoke(f, extraArgs = [], env = {}) {
       },
     },
   );
+}
+
+function git(cwd, args) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  return result.stdout.trim();
+}
+
+function addOrigin(f, branch = "main") {
+  const origin = path.join(f.dir, "origin.git");
+  git(f.dir, ["init", "--bare", "-q", origin]);
+  git(f.dir, ["remote", "add", "origin", origin]);
+  git(f.dir, ["push", "-q", "origin", `HEAD:refs/heads/${branch}`]);
+  return origin;
+}
+
+function advanceOrigin(f, origin, branch = "main") {
+  const writer = path.join(f.dir, `writer-${Date.now()}`);
+  git(f.dir, ["clone", "-q", "--branch", branch, origin, writer]);
+  git(writer, ["config", "user.email", "test@example.com"]);
+  git(writer, ["config", "user.name", "Test"]);
+  fs.writeFileSync(path.join(writer, "advance.txt"), `${Date.now()}\\n`);
+  git(writer, ["add", "advance.txt"]);
+  git(writer, ["commit", "-qm", "advance origin"]);
+  git(writer, ["push", "-q", "origin", branch]);
+  return git(writer, ["rev-parse", "HEAD"]);
+}
+
+function realTarget(f) {
+  const root = `${f.dir}-remote`;
+  const target = path.join(root, "project");
+  fs.mkdirSync(target, { recursive: true });
+  return {
+    root,
+    target,
+    env: { CRABBOX_TEST_EXEC_REMOTE: "1", CRABBOX_TEST_WORKROOT: target },
+  };
+}
+
+function cleanupRealTarget(f, remote) {
+  fs.rmSync("/tmp/seed.bundle", { force: true });
+  fs.rmSync(remote.root, { recursive: true, force: true });
+  fs.rmSync(f.dir, { recursive: true, force: true });
+}
+
+function configPath(remote) {
+  return path.join(remote.target, ".dev_tools", "config.toml");
+}
+
+function writeConfig(root, content) {
+  const file = path.join(root, ".dev_tools", "config.toml");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, content);
+  return file;
 }
 
 function converge(extraArgs = [], env = {}) {
@@ -242,9 +307,14 @@ test("sibling hashes skip excluded changes and replace changed content", () => {
     assert.match(first.stdout, /sibling sibling: placing content/);
     assert.match(excluded.stdout, /sibling sibling: unchanged, skipping/);
     assert.match(changed.stdout, /sibling sibling: placing content/);
-    const order = ["== bootstrap ==", "== sibling", "== git seed ==", "== deps.get", "== gate job"].map(
-      (part) => first.stdout.indexOf(part),
-    );
+    const order = [
+      "== bootstrap ==",
+      "== sibling",
+      "== git seed ==",
+      "== config.toml ==",
+      "== deps.get",
+      "== gate job",
+    ].map((part) => first.stdout.indexOf(part));
     assert.deepEqual(order, [...order].sort((a, b) => a - b));
   } finally {
     fs.rmSync(f.dir, { recursive: true, force: true });
@@ -389,6 +459,196 @@ test("git seed carries main for remote comparison gates", () => {
     assert.match(heads.stdout, new RegExp(`${main} refs/heads/main`));
   } finally {
     fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("host fetch bundles and imports an ahead origin ref with its objects", () => {
+  const f = fixture("main");
+  const origin = addOrigin(f);
+  const localBase = git(f.dir, ["rev-parse", "refs/heads/main"]);
+  const fetchedBase = advanceOrigin(f, origin);
+  const remote = realTarget(f);
+  try {
+    assert.notEqual(
+      spawnSync("git", ["cat-file", "-e", `${fetchedBase}^{commit}`], { cwd: f.dir }).status,
+      0,
+    );
+    const result = invoke(f, ["--slug", "given-box", "--lease", "cbx_given"], remote.env);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.equal(git(remote.target, ["rev-parse", "refs/heads/main"]), localBase);
+    assert.equal(git(remote.target, ["rev-parse", "refs/remotes/origin/main"]), fetchedBase);
+    git(remote.target, ["cat-file", "-e", `${fetchedBase}^{commit}`]);
+
+    const uploaded = path.join(f.state, "uploaded.bundle");
+    assert.ok(
+      fs.existsSync(uploaded),
+      JSON.stringify({ calls: fs.readFileSync(f.log, "utf8"), state: fs.readdirSync(f.state) }),
+    );
+    const heads = git(f.dir, ["bundle", "list-heads", uploaded]);
+    assert.match(heads, new RegExp(`${fetchedBase} refs/remotes/origin/main`));
+  } finally {
+    cleanupRealTarget(f, remote);
+  }
+});
+
+test("host fetch failure warns once and keeps the ordinary local seed usable", () => {
+  const f = fixture("main");
+  const remote = realTarget(f);
+  try {
+    const result = invoke(f, ["--slug", "given-box", "--lease", "cbx_given"], remote.env);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.equal(result.stderr.match(/warning:.*origin\/main.*skipped/g)?.length, 1);
+    assert.equal(
+      spawnSync("git", ["rev-parse", "--verify", "refs/remotes/origin/main"], {
+        cwd: remote.target,
+      }).status,
+      128,
+    );
+    assert.equal(
+      git(remote.target, ["rev-parse", "refs/heads/main"]),
+      git(f.dir, ["rev-parse", "refs/heads/main"]),
+    );
+  } finally {
+    cleanupRealTarget(f, remote);
+  }
+});
+
+test("host fetch failure removes a previously seeded ref before running the gate", () => {
+  const f = fixture("main");
+  addOrigin(f);
+  const remote = realTarget(f);
+  const args = ["--slug", "given-box", "--lease", "cbx_given", "--gate-job", "gate"];
+  try {
+    const seeded = invoke(f, args, remote.env);
+    assert.equal(seeded.status, 0, seeded.stdout + seeded.stderr);
+    git(remote.target, ["rev-parse", "--verify", "refs/remotes/origin/main"]);
+    git(f.dir, ["remote", "set-url", "origin", path.join(f.dir, "missing-origin.git")]);
+
+    const offline = invoke(f, args, remote.env);
+    assert.equal(offline.status, 0, offline.stdout + offline.stderr);
+    assert.equal(offline.stderr.match(/warning:.*origin\/main.*skipped/g)?.length, 1);
+    assert.equal(
+      spawnSync("git", ["rev-parse", "--verify", "refs/remotes/origin/main"], {
+        cwd: remote.target,
+      }).status,
+      128,
+    );
+  } finally {
+    cleanupRealTarget(f, remote);
+  }
+});
+
+test("origin movement invalidates reuse while an unchanged origin keeps the fast path", () => {
+  const f = fixture("main");
+  const origin = addOrigin(f);
+  const remote = realTarget(f);
+  const args = ["--slug", "given-box", "--lease", "cbx_given"];
+  try {
+    const first = invoke(f, args, remote.env);
+    const second = invoke(f, args, remote.env);
+    const advanced = advanceOrigin(f, origin);
+    const third = invoke(f, args, remote.env);
+    const fourth = invoke(f, args, remote.env);
+    const calls = fs.readFileSync(f.log, "utf8");
+
+    for (const result of [first, second, third, fourth]) {
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+    }
+    assert.match(second.stdout, /git seed: unchanged, skipping/);
+    assert.match(third.stdout, /git seed: placing/);
+    assert.match(fourth.stdout, /git seed: unchanged, skipping/);
+    assert.equal(git(remote.target, ["rev-parse", "refs/remotes/origin/main"]), advanced);
+    assert.equal(calls.match(/command=cat > \/tmp\/seed\.bundle/g)?.length, 2);
+  } finally {
+    cleanupRealTarget(f, remote);
+  }
+});
+
+test("config reconciliation restores, skips identical bytes, and overwrites changes", () => {
+  const f = fixture("main");
+  const remote = realTarget(f);
+  const args = ["--slug", "given-box", "--lease", "cbx_given"];
+  try {
+    writeConfig(f.dir, "host config v1\n");
+    const restored = invoke(f, args, remote.env);
+    assert.equal(restored.status, 0, restored.stdout + restored.stderr);
+    assert.equal(fs.readFileSync(configPath(remote), "utf8"), "host config v1\n");
+
+    const before = fs.statSync(configPath(remote));
+    const identical = invoke(f, args, remote.env);
+    const after = fs.statSync(configPath(remote));
+    assert.equal(identical.status, 0, identical.stdout + identical.stderr);
+    assert.match(identical.stdout, /config\.toml: unchanged, skipping/);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+
+    fs.writeFileSync(configPath(remote), "stale box config\n");
+    const overwritten = invoke(f, args, remote.env);
+    assert.equal(overwritten.status, 0, overwritten.stdout + overwritten.stderr);
+    assert.equal(fs.readFileSync(configPath(remote), "utf8"), "host config v1\n");
+  } finally {
+    cleanupRealTarget(f, remote);
+  }
+});
+
+test("missing host config removes stale box config", () => {
+  const f = fixture("main");
+  const remote = realTarget(f);
+  try {
+    writeConfig(remote.target, "stale box config\n");
+    const result = invoke(f, ["--slug", "given-box", "--lease", "cbx_given"], remote.env);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /config\.toml: stale file removed/);
+    assert.equal(fs.existsSync(configPath(remote)), false);
+  } finally {
+    cleanupRealTarget(f, remote);
+  }
+});
+
+test("linked worktrees use main config fallback and prefer a local override", () => {
+  const f = fixture("main");
+  const linked = `${f.dir}-linked`;
+  const remote = realTarget(f);
+  const args = ["--slug", "given-box", "--lease", "cbx_given"];
+  try {
+    writeConfig(f.dir, "main checkout config\n");
+    git(f.dir, ["worktree", "add", "-q", "-b", "linked", linked]);
+    const fallback = invoke(f, args, remote.env, linked);
+    assert.equal(fallback.status, 0, fallback.stdout + fallback.stderr);
+    assert.equal(fs.readFileSync(configPath(remote), "utf8"), "main checkout config\n");
+
+    writeConfig(linked, "linked override\n");
+    const overridden = invoke(f, args, remote.env, linked);
+    assert.equal(overridden.status, 0, overridden.stdout + overridden.stderr);
+    assert.equal(fs.readFileSync(configPath(remote), "utf8"), "linked override\n");
+  } finally {
+    spawnSync("git", ["worktree", "remove", "--force", linked], { cwd: f.dir });
+    fs.rmSync(linked, { recursive: true, force: true });
+    cleanupRealTarget(f, remote);
+  }
+});
+
+test("failed config transfer removes its temp file and preserves the previous target", () => {
+  const f = fixture("main");
+  const remote = realTarget(f);
+  try {
+    writeConfig(f.dir, "replacement config\n");
+    writeConfig(remote.target, "previous box config\n");
+    const result = invoke(
+      f,
+      ["--slug", "given-box", "--lease", "cbx_given", "--gate-job", "gate"],
+      { ...remote.env, CRABBOX_TEST_FAIL_CONFIG_TRANSFER: "1" },
+    );
+    const calls = fs.readFileSync(f.log, "utf8");
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
+    assert.equal(fs.readFileSync(configPath(remote), "utf8"), "previous box config\n");
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(configPath(remote))).filter((name) => name.startsWith("config.toml.tmp.")),
+      [],
+    );
+    assert.doesNotMatch(calls, /mix deps\.get|crabbox job run/);
+  } finally {
+    cleanupRealTarget(f, remote);
   }
 });
 
