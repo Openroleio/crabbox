@@ -28,7 +28,9 @@ command -v "$CRABBOX" >/dev/null || CRABBOX=~/Applications/crabbox
 
 SLUG="" LEASE="" BOOTSTRAP="" GATE_JOB="" BASE_REF=""
 SIBLINGS=()
-SIBLING_EXCLUDES=("_build" "deps" ".git" "node_modules")
+# Keep the fingerprint and archive filters identical. Siblings bypass the
+# project's normal sync filters, so exclude secrets and native/cache output here.
+SIBLING_EXCLUDES=("_build" "deps" ".git" "node_modules" "target" ".cache" ".dev_tools" ".crabbox" ".env" ".env.*" ".envrc" "*.pem" "*.key" "__pycache__" "tmp" "cover" ".elixir_ls" ".lexical")
 while [ $# -gt 0 ]; do
   case "$1" in
     --slug) SLUG=$2; shift 2 ;;
@@ -158,7 +160,7 @@ reconcile_dev_tools_config() {
 stream_sibling_archive() {
   local sib=$1 name=$2 exclude
   local args=()
-  for exclude in "${SIBLING_EXCLUDES[@]}"; do args+=(--exclude="$name/$exclude"); done
+  for exclude in "${SIBLING_EXCLUDES[@]}"; do args+=(--exclude="$exclude"); done
   tar -C "$(dirname "$(realpath "$sib")")" -czf - "${args[@]}" "$name"
 }
 sibling_content_hash() {
@@ -173,7 +175,7 @@ sibling_content_hash() {
   manifest=$temp/manifest
   for exclude in "${SIBLING_EXCLUDES[@]}"; do
     [ "${#find_excludes[@]}" -eq 0 ] || find_excludes+=(-o)
-    find_excludes+=(-path "$root/$exclude")
+    find_excludes+=(-name "$exclude")
   done
   if result=$(
     set -e
