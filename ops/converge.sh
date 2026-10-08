@@ -46,14 +46,14 @@ if { [ -n "$SLUG" ] && [ -z "$LEASE" ]; } || { [ -z "$SLUG" ] && [ -n "$LEASE" ]
   exit 2
 fi
 
-FRESH_LEASE=0 BUNDLE="" REMOTE_BUNDLE=0 SSH_COMMAND="" CONFIG_SNAPSHOT=""
+FRESH_LEASE=0 BUNDLE="" REMOTE_BUNDLE=0 REMOTE_SEED="" SSH_COMMAND="" CONFIG_SNAPSHOT=""
 cleanup_on_exit() {
   status=$?
   trap - EXIT
   if [ -n "$BUNDLE" ]; then rm -f "$BUNDLE" || true; fi
   if [ -n "$CONFIG_SNAPSHOT" ]; then rm -f "$CONFIG_SNAPSHOT" || true; fi
   if [ "$REMOTE_BUNDLE" -eq 1 ] && [ -n "$SSH_COMMAND" ]; then
-    rssh "rm -f /tmp/seed.bundle" </dev/null >/dev/null 2>&1 || true
+    rssh "rm -f $REMOTE_SEED" </dev/null >/dev/null 2>&1 || true
   fi
   if [ "$status" -ne 0 ] && [ "$FRESH_LEASE" -eq 1 ]; then
     cleanup_id=${SLUG:-$LEASE}
@@ -265,13 +265,15 @@ else
     test "$(git bundle list-heads "$BUNDLE" "refs/remotes/origin/$BASE_BRANCH")" = \
       "$FETCHED_BASE refs/remotes/origin/$BASE_BRANCH"
   fi
+  # One seed file per converge: two lanes on one host converge at the same time.
+  REMOTE_SEED="/tmp/seed.$(basename "$BUNDLE").bundle"
   REMOTE_BUNDLE=1
-  rssh "cat > /tmp/seed.bundle" <"$BUNDLE"
+  rssh "cat > $REMOTE_SEED" <"$BUNDLE"
   rm -f "$BUNDLE"
   BUNDLE=""
   # shellcheck disable=SC2016 # Variables expand in the remote bash -c.
-  rssh_args bash -c 'set -e; cd "$1"; git init -q -b "$2" 2>/dev/null || true; git fetch -q /tmp/seed.bundle "$2"; git update-ref "refs/heads/$2" FETCH_HEAD; if [ -n "$5" ] && [ "$2" != "$4" ]; then git fetch -q /tmp/seed.bundle "$4"; git update-ref "refs/heads/$4" FETCH_HEAD; fi; if [ -n "$6" ]; then git fetch -q /tmp/seed.bundle "refs/remotes/origin/$4"; git update-ref "refs/remotes/origin/$4" "$6"; test "$(git rev-parse "refs/remotes/origin/$4")" = "$6"; git cat-file -e "$6^{commit}"; fi; git symbolic-ref HEAD "refs/heads/$2"; git reset -q --mixed "$2"; test "$(git rev-parse HEAD)" = "$3"; rm -f /tmp/seed.bundle; git log --oneline -1' \
-    _ "$WORKROOT" "$BRANCH" "$LOCAL_HEAD" "$BASE_BRANCH" "$LOCAL_BASE" "$FETCHED_BASE"
+  rssh_args bash -c 'set -e; cd "$1"; git init -q -b "$2" 2>/dev/null || true; git fetch -q "$7" "$2"; git update-ref "refs/heads/$2" FETCH_HEAD; if [ -n "$5" ] && [ "$2" != "$4" ]; then git fetch -q "$7" "$4"; git update-ref "refs/heads/$4" FETCH_HEAD; fi; if [ -n "$6" ]; then git fetch -q "$7" "refs/remotes/origin/$4"; git update-ref "refs/remotes/origin/$4" "$6"; test "$(git rev-parse "refs/remotes/origin/$4")" = "$6"; git cat-file -e "$6^{commit}"; fi; git symbolic-ref HEAD "refs/heads/$2"; git reset -q --mixed "$2"; test "$(git rev-parse HEAD)" = "$3"; rm -f "$7"; git log --oneline -1' \
+    _ "$WORKROOT" "$BRANCH" "$LOCAL_HEAD" "$BASE_BRANCH" "$LOCAL_BASE" "$FETCHED_BASE" "$REMOTE_SEED"
   REMOTE_BUNDLE=0
 fi
 

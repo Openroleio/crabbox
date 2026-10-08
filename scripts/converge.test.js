@@ -24,10 +24,10 @@ function fixture(branch = "test") {
     `#!/usr/bin/env bash
 printf 'transport argc=%s command=%s\\n' "$#" "$*" >>"$CRABBOX_TEST_LOG"
 if [[ "$#" != 1 ]]; then exit 43; fi
-if [[ "$1" == 'cat > /tmp/seed.bundle' ]]; then
+if [[ "$1" == 'cat > /tmp/seed.'*'.bundle' ]]; then
   cat >"$CRABBOX_TEST_STATE/uploaded.bundle"
   if [[ "\${CRABBOX_TEST_EXEC_REMOTE:-0}" == 1 ]]; then
-    cp "$CRABBOX_TEST_STATE/uploaded.bundle" /tmp/seed.bundle
+    cp "$CRABBOX_TEST_STATE/uploaded.bundle" "\${1#cat > }"
   fi
   exit
 fi
@@ -226,7 +226,7 @@ test("a fresh successful lease uses CLI SSH access and remains live", () => {
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(calls, /crabbox ssh --id fresh-box/);
   assert.match(calls, /run --id fresh-box --no-sync --no-hydrate -- true/);
-  assert.match(calls, /transport argc=1 command=cat > \/tmp\/seed.bundle/);
+  assert.match(calls, /transport argc=1 command=cat > \/tmp\/seed\.crabbox-converge\.\w+\.bundle/);
   assert.doesNotMatch(calls, /crabbox stop/);
   assert.deepEqual(leftovers, []);
 });
@@ -277,7 +277,7 @@ test("a supplied lease is never cleaned up on failure", () => {
 test("seed failures clean local and remote bundles before preserving status", () => {
   const { result, calls, leftovers } = converge([], { CRABBOX_TEST_REMOTE_FAIL: "1" });
   assert.equal(result.status, 41, result.stdout + result.stderr);
-  assert.match(calls, /transport argc=1 command=rm -f \/tmp\/seed.bundle/);
+  assert.match(calls, /transport argc=1 command=rm -f \/tmp\/seed\.crabbox-converge\.\w+\.bundle/);
   assert.deepEqual(leftovers, []);
 });
 
@@ -357,7 +357,7 @@ test("reused zero-sibling runs skip matching git seed but always rerun the gate"
     assert.equal(second.status, 0, second.stdout + second.stderr);
     assert.match(second.stdout, /git seed: unchanged, skipping/);
     assert.equal(calls.match(/crabbox job run --id given-box gate/g)?.length, 2);
-    assert.equal(calls.match(/command=cat > \/tmp\/seed\.bundle/g)?.length, 1);
+    assert.equal(calls.match(/command=cat > \/tmp\/seed\.crabbox-converge\.\w+\.bundle/g)?.length, 1);
     const order = ["== bootstrap ==", "== git seed ==", "== deps.get", "== gate job"].map((part) =>
       second.stdout.indexOf(part),
     );
@@ -558,7 +558,7 @@ test("origin movement invalidates reuse while an unchanged origin keeps the fast
     assert.match(third.stdout, /git seed: placing/);
     assert.match(fourth.stdout, /git seed: unchanged, skipping/);
     assert.equal(git(remote.target, ["rev-parse", "refs/remotes/origin/main"]), advanced);
-    assert.equal(calls.match(/command=cat > \/tmp\/seed\.bundle/g)?.length, 2);
+    assert.equal(calls.match(/command=cat > \/tmp\/seed\.crabbox-converge\.\w+\.bundle/g)?.length, 2);
   } finally {
     cleanupRealTarget(f, remote);
   }
