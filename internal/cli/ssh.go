@@ -1757,8 +1757,13 @@ fi
 	return "bash -lc " + shellQuote(script)
 }
 
+// remoteSyncMetaDirScript sets $meta_dir. A workdir synced before it gained
+// .git keeps its manifest in .crabbox; adopting it keeps prune aware of the
+// files that earlier sync wrote.
 func remoteSyncMetaDirScript() string {
-	return "meta_dir=$(if [ -d .git ]; then printf %s .git/crabbox; else printf %s .crabbox; fi); "
+	return "meta_dir=$(if [ -d .git ]; then printf %s .git/crabbox; else printf %s .crabbox; fi); " +
+		"if [ \"$meta_dir\" = .git/crabbox ] && [ ! -f .git/crabbox/sync-manifest ] && [ -f .crabbox/sync-manifest ]; then " +
+		"mkdir -p .git/crabbox && mv -f .crabbox/sync-manifest .git/crabbox/sync-manifest; fi; "
 }
 
 func exitCode(err error) int {

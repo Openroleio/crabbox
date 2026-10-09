@@ -1526,6 +1526,36 @@ func TestRemoteSeedSyncManifestFromGitWritesInitialTrackedManifest(t *testing.T)
 	}
 }
 
+func TestRemoteSyncAdoptsLegacyManifestAfterGitSeed(t *testing.T) {
+	workdir := t.TempDir()
+	cmd := exec.Command("git", "init", "-q")
+	cmd.Dir = workdir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+	mustWriteTestFile(t, filepath.Join(workdir, ".crabbox", "sync-manifest"), "keep.txt\x00stale.txt\x00")
+	mustWriteTestFile(t, filepath.Join(workdir, ".git", "crabbox", "sync-manifest.new"), "keep.txt\x00")
+	mustWriteTestFile(t, filepath.Join(workdir, "keep.txt"), "keep")
+	mustWriteTestFile(t, filepath.Join(workdir, "stale.txt"), "stale")
+
+	for _, script := range []string{remoteSeedSyncManifestFromGit(workdir), remotePruneSyncManifest(workdir)} {
+		cmd := exec.Command("bash", "-lc", script)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("remote script failed: %v\n%s", err, out)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(workdir, "stale.txt")); !os.IsNotExist(err) {
+		t.Fatalf("stale.txt from the pre-git sync should be pruned, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "keep.txt")); err != nil {
+		t.Fatalf("keep.txt should survive prune: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, ".crabbox", "sync-manifest")); !os.IsNotExist(err) {
+		t.Fatalf("legacy manifest should be moved, stat err=%v", err)
+	}
+}
+
 func TestRemotePruneSyncManifestPrunesManagedFiles(t *testing.T) {
 	testRemotePruneSyncManifestPrunesManagedFiles(t, remotePruneSyncManifest)
 }
