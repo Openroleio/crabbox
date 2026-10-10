@@ -1212,6 +1212,42 @@ func TestSSHControlPathIsScopedByProxyAndCertificate(t *testing.T) {
 	}
 }
 
+func TestStaticLeaseControlPathIsScopedByLease(t *testing.T) {
+	controlPath := func(id, workRoot string) string {
+		t.Helper()
+		cfg := baseConfig()
+		cfg.Provider = staticProvider
+		cfg.SSHUser = "crabbox"
+		cfg.SSHPort = "22"
+		cfg.SSHKey = "/home/crabbox/.ssh/id_ed25519"
+		cfg.Static.Host = "gpu-runner"
+		cfg.Static.ID = id
+		cfg.Static.WorkRoot = workRoot
+		_, target, _, err := staticLease(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sshControlPath(target)
+	}
+	laneA := controlPath("pool-1", "/home/crabbox/crabbox-work")
+	laneB := controlPath("pool-1", "/home/crabbox/crabbox-work2")
+	laneASlot2 := controlPath("pool-2", "/home/crabbox/crabbox-work")
+	if laneA == laneB {
+		t.Fatalf("two lanes on one host should get two control paths: %q", laneA)
+	}
+	if laneA == laneASlot2 || laneB == laneASlot2 {
+		t.Fatalf("two slots of one lane should get two control paths: %q %q %q", laneA, laneB, laneASlot2)
+	}
+	if again := controlPath("pool-1", "/home/crabbox/crabbox-work"); again != laneA {
+		t.Fatalf("one lease should keep one control path: %q != %q", again, laneA)
+	}
+	for _, path := range []string{laneA, laneB, laneASlot2} {
+		if !strings.HasPrefix(filepath.Base(path), "crabbox-ssh-") || !strings.HasSuffix(path, "-%C") {
+			t.Fatalf("unexpected control path %q", path)
+		}
+	}
+}
+
 func TestSSHWaitProgressIncludesElapsedAndRemaining(t *testing.T) {
 	got := sshWaitProgressMessage(
 		&SSHTarget{Host: "203.0.113.10", Port: "2222"},

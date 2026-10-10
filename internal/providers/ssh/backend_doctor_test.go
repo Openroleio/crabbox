@@ -107,6 +107,40 @@ func TestStaticSSHRequestedSlugPersistsThroughClaimedResolveAndList(t *testing.T
 	}
 }
 
+func TestStaticSSHClaimedResolveKeepsControlScope(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	oldWait := waitForSSH
+	waitForSSH = func(context.Context, *SSHTarget, io.Writer) error { return nil }
+	t.Cleanup(func() { waitForSSH = oldWait })
+
+	cfg := Config{Provider: "ssh"}
+	cfg.SSHUser = "crabbox"
+	cfg.Static.Host = "gpu-runner"
+	cfg.Static.ID = "pool-2"
+	cfg.Static.WorkRoot = "/home/crabbox/crabbox-work2"
+	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	lease, err := backend.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.SSH.ControlScope == "" {
+		t.Fatalf("acquired static lease has no control scope: %#v", lease.SSH)
+	}
+
+	resolveCfg := cfg
+	resolveCfg.Static.WorkRoot = ""
+	backend = NewStaticSSHLeaseBackend(Provider{}.Spec(), resolveCfg, Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	resolved, err := backend.Resolve(context.Background(), ResolveRequest{ID: lease.LeaseID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.SSH.ControlScope != lease.SSH.ControlScope {
+		t.Fatalf("resolved control scope=%q, want acquired %q", resolved.SSH.ControlScope, lease.SSH.ControlScope)
+	}
+}
+
 func TestStaticSSHRequestedSlugAvoidsClaimCollision(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())

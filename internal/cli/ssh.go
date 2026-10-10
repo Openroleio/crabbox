@@ -43,6 +43,8 @@ type SSHTarget struct {
 	ProxyCommand           string
 	ChildEnvDenylist       []string
 	ChildEnv               map[string]string
+	// ControlScope separates ssh masters of leases that share host, user and key.
+	ControlScope string
 }
 
 func isLocalMacTarget(target SSHTarget) bool {
@@ -818,6 +820,7 @@ func sshControlPath(target SSHTarget) string {
 		target.KnownHostsFile,
 		target.HostKeyAlias,
 		target.ProxyCommand,
+		target.ControlScope,
 	}, "\x00")
 	sum := sha1.Sum([]byte(scope))
 	return filepath.Join("/tmp", "crabbox-ssh-"+hex.EncodeToString(sum[:4])+"-%C")
