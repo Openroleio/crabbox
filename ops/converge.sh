@@ -287,8 +287,8 @@ fi
 
 reconcile_dev_tools_config
 
-echo "== deps.get (with siblings present) =="
-"$CRABBOX" run --id "$SLUG" --no-sync --no-hydrate -- bash -lc "mix deps.get"
+echo "== deps.get (with siblings present; skipped without mix.exs) =="
+"$CRABBOX" run --id "$SLUG" --no-sync --no-hydrate -- bash -lc "[ ! -f mix.exs ] || mix deps.get"
 
 if [ -n "$GATE_JOB" ]; then
   echo "== gate job: $GATE_JOB =="
